@@ -2,10 +2,21 @@ import requests
 import os
 import logging
 
-# Configuration
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+def _load_token_from_config():
+    """Fallback loader so config.py-based tokens also work."""
+    try:
+        from config import TELEGRAM_BOT_TOKEN
+        return TELEGRAM_BOT_TOKEN
+    except Exception:
+        return None
+
+
+# Configuration (env takes precedence, then config.py)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or _load_token_from_config()
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage" if TOKEN else None
 MAX_LENGTH = 4000  # Leave a small buffer below the 4096 limit
+
 
 def send_message(chat_id, text, parse_mode="Markdown"):
     """
@@ -13,6 +24,10 @@ def send_message(chat_id, text, parse_mode="Markdown"):
     Handles length limits and basic error reporting.
     """
     if not text:
+        return
+
+    if not TOKEN or not BASE_URL:
+        logging.error("Cannot send Telegram message: TELEGRAM_BOT_TOKEN is not configured.")
         return
 
     # 1. Truncate if too long (Safety first)

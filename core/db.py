@@ -1,73 +1,144 @@
+"""
+core/db.py — Single database manager. Import the singleton `db` everywhere.
+"""
 import sqlite3
-from datetime import datetime
-import os
+import logging
+from datetime import datetime, timedelta, timezone
+from core.schema import DB_PATH, initialize_db
 
-# Path to the database file
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'study_buddy.db')
+logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
+        # Ensure the database and tables exist before any operation.
+        try:
+            initialize_db(self.db_path)
+        except Exception as e:
+            logger.error("DB initialisation failed: %s", e)
 
-    def _get_connection(self):
-        """Helper to create a connection with row factory for dictionary-like results."""
-        conn = sqlite3.connect(self.db_path)
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")   # Allow concurrent readers
         return conn
 
-    def insert_event(self, event_obj, label="neutral"):
-        """
-        Takes an aw_core Event object and saves it to the database.
-        """
-        query = """
-        INSERT INTO events (timestamp, app, title, idle_sec, label)
-        VALUES (?, ?, ?, ?, ?)
-        """
-        # Extract data from the Event object
+    # ── Generic helpers (used by memory_store etc.) ───────────────────────────
 
-        timestamp_str = event_obj.timestamp.isoformat()
-        app = event_obj.data.get("app", "Unknown")
-        title = event_obj.data.get("title", "Unknown")
-        # We calculate idle_sec elsewhere or pass it in; here we assume it's in data or passed
-        idle_sec = event_obj.data.get("idle_sec", 0)
-
+    def execute_custom(self, query, params=()):
+        """Run an INSERT / UPDATE / DELETE and commit."""
         try:
-            with self._get_connection() as conn:
-                conn.execute(query, (timestamp_str, app, title, idle_sec, label))
+            with self._get_conn() as conn:
+                conn.execute(query, params)
                 conn.commit()
         except sqlite3.Error as e:
-            print(f"Database Insert Error: {e}")
+            logger.error("DB execute error: %s", e)
 
-    def fetch_daily_events(self, target_date):
-        """
-        Fetches all events for a specific day (YYYY-MM-DD).
-        """
-        query = "SELECT * FROM events WHERE timestamp LIKE ? ORDER BY timestamp ASC"
-        date_query = f"{target_date}%"
-
+    def fetch_custom(self, query, params=()):
+        """Run a SELECT and return list-of-dicts."""
         try:
-            with self._get_connection() as conn:
-                rows = conn.execute(query, (date_query,)).fetchall()
-                # Convert rows to list of dicts for easier processing in aggregate.py
-                return [dict(row) for row in rows]
+            with self._get_conn() as conn:
+                rows = conn.execute(query, params).fetchall()
+                return [dict(r) for r in rows]
         except sqlite3.Error as e:
-            print(f"Database Fetch Error: {e}")
+            logger.error("DB fetch error: %s", e)
             return []
 
-    def store_report(self, day, text, summary_json):
-        """Saves the final WhatsApp-style report."""
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    def insert_event(self, event_dict: dict, label: str = "neutral"):
+        """
+        Persist a raw activity sample.
+        event_dict must have keys: timestamp (datetime or ISO str), app, title, idle_sec.
+        """
+        ts = event_dict.get("timestamp", datetime.now(timezone.utc))
+        if isinstance(ts, datetime):
+            ts = ts.isoformat()
+
         query = """
-        INSERT OR REPLACE INTO daily_reports (day, generated_text, summary_json)
-        VALUES (?, ?, ?)
+            INSERT INTO events (timestamp, app, title, idle_sec, label)
+            VALUES (?, ?, ?, ?, ?)
         """
         try:
-            with self._get_connection() as conn:
-                conn.execute(query, (day, text, summary_json))
+            with self._get_conn() as conn:
+                conn.execute(query, (
+                    ts,
+                    event_dict.get("app", "Unknown"),
+                    event_dict.get("title", ""),
+                    event_dict.get("idle_sec", 0),
+                    label,
+                ))
                 conn.commit()
         except sqlite3.Error as e:
-            print(f"Database Report Error: {e}")
+            logger.error("DB insert_event error: %s", e)
+
+    def fetch_daily_events(self, target_date: str):
+        """
+        Fetch all events for a local calendar date (YYYY-MM-DD).
+
+        Events are stored as UTC ISO strings. We convert the local-date
+        midnight boundaries to UTC so queries are timezone-correct even
+        when local time != UTC (e.g. IST = UTC+5:30).
+        """
+        try:
+            # Build local midnight and the next midnight in UTC
+            local_tz = datetime.now().astimezone().tzinfo
+            local_midnight = datetime.strptime(target_date, "%Y-%m-%d").replace(
+                tzinfo=local_tz
+            )
+            utc_start = local_midnight.astimezone(timezone.utc).isoformat()
+            utc_end = (local_midnight + timedelta(days=1)).astimezone(
+                timezone.utc
+            ).isoformat()
+
+            query = """
+                SELECT * FROM events
+                WHERE timestamp >= ? AND timestamp < ?
+                ORDER BY timestamp ASC
+            """
+            return self.fetch_custom(query, (utc_start, utc_end))
+        except Exception as e:
+            logger.error("fetch_daily_events error: %s", e)
+            return []
+
+    # ── Reports ───────────────────────────────────────────────────────────────
+
+    def store_report(self, day: str, text: str, summary_json: str):
+        """Upsert a daily LLM report (day = YYYY-MM-DD local date)."""
+        query = """
+            INSERT OR REPLACE INTO daily_reports (day, generated_text, summary_json)
+            VALUES (?, ?, ?)
+        """
+        self.execute_custom(query, (day, text, summary_json))
+
+    def fetch_report(self, day: str):
+        """Return cached report for a day, or None."""
+        rows = self.fetch_custom(
+            "SELECT * FROM daily_reports WHERE day = ?", (day,)
+        )
+        return rows[0] if rows else None
+
+    # ── User settings ─────────────────────────────────────────────────────────
+
+    def update_user_setting(self, chat_id, key: str, value):
+        """Upsert a user-specific setting."""
+        query = """
+            INSERT INTO user_settings (chat_id, key, value)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, key) DO UPDATE SET value=excluded.value
+        """
+        self.execute_custom(query, (str(chat_id), key, str(value)))
+
+    def get_user_setting(self, chat_id, key: str, default=None):
+        rows = self.fetch_custom(
+            "SELECT value FROM user_settings WHERE chat_id=? AND key=?",
+            (str(chat_id), key),
+        )
+        return rows[0]["value"] if rows else default
 
 
-# Create a singleton instance for easy importing
+# Singleton — import this everywhere
 db = DatabaseManager()
