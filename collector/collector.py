@@ -1,6 +1,6 @@
 """
 collector/collector.py — Main data collection loop.
-Do NOT run this directly; use `python run_collector.py` from the project root.
+use `python run_collector.py` from the project root.
 """
 import time
 import logging

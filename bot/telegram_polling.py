@@ -1,6 +1,6 @@
 """
 bot/telegram_polling.py — Long-polling loop for the Telegram Bot API.
-Do NOT run this directly; use `python run_bot.py` from the project root.
+ use `python run_bot.py` from the project root.
 """
 import os
 import sys
